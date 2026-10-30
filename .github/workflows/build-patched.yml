@@ -1,0 +1,320 @@
+name: Build patched Prism Launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Build a specific upstream tag/branch (e.g. 11.1.1, develop). Empty = track upstream releases automatically."
+        required: false
+        default: ""
+      qt_version:
+        description: "Force a Qt version (e.g. 6.10.2). Empty = use the tag's own recipe."
+        required: false
+        default: ""
+      force_rebuild:
+        description: "Rebuild even if a release for this tag already exists (overwrites it)."
+        required: false
+        type: boolean
+        default: false
+
+  schedule:
+    - cron: "23 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched
+  cancel-in-progress: false
+
+jobs:
+  # Kit-update nudge: compares this copy's KIT-VERSION against the template's
+  # and keeps one "Template update available" issue in step. Runs FIRST, in
+  # parallel with everything else, so an out-of-date copy is told within a
+  # minute of starting a run instead of after the compiler finishes. It
+  # never turns a run red (the script is fail-soft on purpose). The build
+  # side of the same rule lives in the decide job (kit 12): a copy whose kit
+  # is behind the template skips the build entirely, loudly.
+  kit-update-check:
+    if: ${{ vars.no_binaries != 'true' && vars.kit_updates_off != 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      TEMPLATE_SOURCE: FMHYHelper/PrismLauncherOfflinePatch
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out the kit files
+        uses: actions/checkout@v7.0.1
+
+      - name: Compare kit version against template
+        shell: pwsh
+        run: ./scripts/notify-kit-update.ps1
+
+  decide:
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.decide.outputs.builds }}
+      has_builds: ${{ steps.decide.outputs.has_builds }}
+    steps:
+      - name: Check out template
+        uses: actions/checkout@v7.0.1
+        with:
+          path: kit
+
+      - id: decide
+        name: Decide what to build
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # true when this repository publishes releases; repositories created
+          # from the template do not define the no_binaries variable, so they
+          # publish. The template itself sets it and stays binary-free.
+          PRISM_PUBLISH: ${{ vars.no_binaries != 'true' }}
+          # Which platforms to build (the repositories variable `platforms`):
+          # comma or space separated subset of windows,linux,macos, or empty /
+          # 'all' for every platform. Lets cost-sensitive copies (e.g. private
+          # repositories running macOS runners) slim the matrix down.
+          KIT_PLATFORMS: ${{ vars.platforms || '' }}
+          # Kit-age gate (kit 12): decide.ps1 compares this copy's KIT-VERSION
+          # against the template's and refuses to build while the copy is
+          # behind (fail-open; loud banner in the log and run summary). The
+          # repository variable `build_if_old` set to true bypasses the gate.
+          TEMPLATE_SOURCE: FMHYHelper/PrismLauncherOfflinePatch
+          KIT_BUILD_IF_OLD: ${{ vars.build_if_old || '' }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          INPUT_QT: ${{ inputs.qt_version }}
+          INPUT_FORCE: ${{ inputs.force_rebuild }}
+        run: |
+          $force = $false
+          if ($env:INPUT_FORCE -eq 'true') { $force = $true }
+          & ./kit/scripts/decide.ps1 -UpstreamRef $env:INPUT_REF -QtOverride $env:INPUT_QT -Force:$force -OutputFile $env:GITHUB_OUTPUT
+
+  build:
+    needs: decide
+    if: ${{ needs.decide.outputs.has_builds == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.decide.outputs.builds) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      PRISM_TAG: ${{ matrix.tag }}
+      # The macOS preset builds a universal (arm64 + x86_64) binary; the
+      # deployment target comes from the tag's own matrix.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_target }}
+      PRESET: ${{ matrix.preset }}
+      BUILD_PLATFORM: official
+    steps:
+      - name: Check out template
+        uses: actions/checkout@v7.0.1
+        with:
+          path: kit
+
+      - name: Clone upstream at ${{ matrix.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init -q .
+          git remote add origin https://github.com/PrismLauncher/PrismLauncher.git
+          $ref = $env:PRISM_TAG
+          git fetch -q --depth 1 origin "refs/tags/$ref"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Tag not found, trying branch $ref"
+            git fetch -q --depth 1 origin "refs/heads/$ref"
+            if ($LASTEXITCODE -ne 0) { throw "Upstream ref $ref not found" }
+          }
+          git checkout -q --detach FETCH_HEAD
+          git submodule update --init --recursive --depth 1
+          Write-Host "Cloned PrismLauncher at $ref (commit $(git rev-parse --short HEAD))"
+
+      - name: Apply patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patches = Get-ChildItem kit/patches -Filter '*.patch' | Sort-Object Name
+          if ($patches.Count -eq 0) { throw "No patch files found in kit/patches" }
+          foreach ($p in $patches) {
+            Write-Host "Checking $($p.Name)"
+            git apply --check --ignore-whitespace $p.FullName
+            git apply --ignore-whitespace $p.FullName
+            Write-Host "Applied $($p.Name)"
+          }
+
+      - name: Set up build dependencies (the tag's own recipe)
+        uses: ./.github/actions/setup-dependencies
+        with:
+          build-type: Release
+          artifact-name: ${{ matrix.artifact_name }}
+          vcvars-arch: ${{ matrix.vcvars }}
+          qt-version: ${{ matrix.qt_version }}
+
+      - name: Configure (cmake --preset ${{ matrix.preset }})
+        shell: pwsh
+        run: cmake --preset $env:PRESET
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build --preset $env:PRESET --config Release --parallel
+
+      - name: Package (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        uses: ./.github/actions/package/linux
+        with:
+          version: ${{ matrix.tag }}
+          build-type: Release
+          artifact-name: ${{ matrix.artifact_name }}
+          qt-version: ${{ matrix.qt_version }}
+
+      - name: Package (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        uses: ./.github/actions/package/macos
+        with:
+          version: ${{ matrix.tag }}
+          build-type: Release
+          artifact-name: ${{ matrix.artifact_name }}
+
+      # Windows runs no packaging step (kit 11): the tag's own Windows
+      # packaging only produced outputs this kit never claims (NSIS
+      # installer, portable zip, binary zip) and dragged in an external,
+      # pinned NSCurl download - the flake point that killed a real copy
+      # run on 2026-10-25. The exe the kit ships is the build tree's own
+      # prismlauncher.exe, staged below, exactly as every kit-6+ run did.
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:PRISM_TAG
+          # Release shape (kit 9): one relevant file per platform, plus the
+          # macOS pair (DMG + bare binary) - the drop-in story everywhere.
+          # Since kit 11 Windows claims its exe straight from the build
+          # tree (no packaging action at all - see the note above); the
+          # remaining unclaimed side effects are the Linux portable
+          # tarball and the macOS binary zip.
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $exe = Get-ChildItem build -Recurse -File | Where-Object { $_.Name -ieq 'prismlauncher.exe' } | Select-Object -First 1
+            if ($null -eq $exe) { throw "prismlauncher.exe not found in build output" }
+            Copy-Item $exe.FullName "out/PrismLauncher.exe"
+          }
+          elseif ($env:RUNNER_OS -eq 'Linux') {
+            $appimage = Get-ChildItem -File | Where-Object { $_.Name -like "PrismLauncher-Linux-*x86_64.AppImage" } | Select-Object -First 1
+            if ($null -eq $appimage) { throw "AppImage not found in workspace" }
+            # Kit 17: stage under the official unversioned name, so the
+            # user's swap needs no rename and existing menu or Steam
+            # shortcuts keep pointing at the launcher.
+            Move-Item $appimage.FullName "out/PrismLauncher-Linux-x86_64.AppImage"
+          }
+          else {
+            $dmg = Get-ChildItem -File -Filter "PrismLauncher.dmg" | Select-Object -First 1
+            if ($null -eq $dmg) { throw "DMG not found in workspace" }
+            Move-Item $dmg.FullName "out/PrismLauncher-macOS-$tag.dmg"
+            # The bare drop-in binary: the patched universal executable from
+            # inside the freshly packaged bundle. Upstream's macOS packaging
+            # signs the inner binary and then renames the bundle to
+            # "Prism Launcher.app"; the regexp tolerates either bundle name.
+            $appBinary = Get-ChildItem install -Recurse -File |
+              Where-Object { $_.FullName -match 'Prism ?Launcher\.app[/\\]Contents[/\\]MacOS[/\\]prismlauncher$' } |
+              Select-Object -First 1
+            if ($null -eq $appBinary) { throw "patched prismlauncher binary not found under install/" }
+            Copy-Item $appBinary.FullName "out/prismlauncher-macos"
+            & chmod +x "out/prismlauncher-macos"
+          }
+          Write-Host "Staged:"
+          Get-ChildItem out -File | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Upload for publishing
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          # The publish job groups these directories by tag; the name format
+          # is parsed by scripts/publish.ps1 - keep tag and platform suffix.
+          name: release-${{ matrix.tag }}-${{ matrix.platform }}
+          path: out/**
+          if-no-files-found: error
+
+  # One release per tag, containing every platform that succeeded. Collects
+  # the build jobs' artifacts, appends the source patch bundle and one
+  # checksums.txt, and publishes with the kit's release-notes template.
+  # Publishes nothing on the template itself (no_binaries keeps it binary-free).
+  publish:
+    needs: [decide, build]
+    if: ${{ needs.build.result == 'success' && vars.no_binaries != 'true' }}
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_JSON: ${{ needs.decide.outputs.builds }}
+      GH_TOKEN: ${{ github.token }}
+      # This job runs in the kit checkout, not the upstream clone; the pin
+      # keeps every gh call inside this repository.
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out template
+        uses: actions/checkout@v7.0.1
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: false
+
+      - name: Publish releases
+        shell: pwsh
+        run: ./scripts/publish.ps1
+
+  finalize:
+    needs: [decide, build, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_JSON: ${{ needs.decide.outputs.builds }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      PUBLISH_RESULT: ${{ needs.publish.result }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Update state file
+        shell: bash
+        run: |
+          # Kit-20: write the heartbeat on the branch's live tip, not on the
+          # commit this run was dispatched with. A run dispatched while the
+          # previous run was still finalizing freezes one heartbeat behind,
+          # and its own finalize would then have to replay a conflicting
+          # write to .state/last-build.json over that heartbeat (run #25,
+          # 2026-10-28). The tree is clean here, so this is a pure
+          # fast-forward and cannot conflict. It also means the state
+          # update reads the tip's state, not a stale checkout's.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git merge --ff-only "origin/${GITHUB_REF_NAME}"
+          ADV=""
+          if [ "$BUILD_RESULT" = "success" ]; then
+            # On the template itself the publish job is skipped (it must not
+            # host binaries); that still counts as a complete run there.
+            if [ "$PUBLISH_RESULT" = "success" ] || [ "$PUBLISH_RESULT" = "skipped" ]; then
+              ADV="--advance"
+            fi
+          fi
+          pwsh ./scripts/update-state.ps1 -BuildsJson "$BUILD_JSON" $ADV
+
+      - name: Commit state heartbeat
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .state/last-build.json
+          if git diff --cached --quiet; then
+            echo "state unchanged; nothing to commit"
+            exit 0
+          fi
+          git commit -m "state: automatic upstream heartbeat"
+          # Kit-20: one retry if another push (a heartbeat from a run that
+          # finalized while this one built, or a kit sync) lands in the
+          # seconds between the fetch above and this push. During a rebase
+          # replay "theirs" is the commit being replayed - this run's
+          # heartbeat, the fresher state file - so a same-file conflict
+          # resolves in its favor. A second failure stays loud: it can only
+          # mean real divergence, which must be looked at.
+          if ! git push origin HEAD; then
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase -X theirs "origin/${GITHUB_REF_NAME}"
+            git push origin HEAD
+          fi
